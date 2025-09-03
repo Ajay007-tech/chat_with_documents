@@ -14,14 +14,6 @@ from qwen_agent.llm.schema import CONTENT, FILE, IMAGE, NAME, ROLE, USER, Messag
 from qwen_agent.log import logger
 from qwen_agent.utils.utils import print_traceback
 
-# Import memory management
-try:
-    from memory_manager import cleanup_memory, emergency_cleanup, get_memory_manager
-    MEMORY_MANAGER_AVAILABLE = True
-except ImportError:
-    MEMORY_MANAGER_AVAILABLE = False
-    logger.warning("Memory manager not available")
-
 try:
     from patching import common_programming_language_extensions
 except ImportError:
@@ -209,10 +201,6 @@ Please select a configuration and click 'Load Model' to begin.
                     
                     # Clear button
                     clear_btn = gr.Button("🗑️ Clear Chat", variant="secondary")
-                    
-                    # Memory cleanup button
-                    if MEMORY_MANAGER_AVAILABLE:
-                        memory_btn = gr.Button("🧹 Free GPU Memory", variant="secondary")
 
                     if self.prompt_suggestions:
                         gr.Examples(
@@ -335,17 +323,11 @@ You can now start chatting and uploading documents!"""
                     _chatbot = []
                     _history.clear()
                     
-                    # Clear memory
-                    if MEMORY_MANAGER_AVAILABLE:
-                        cleanup_memory()
-                        logger.info("Memory cleaned after chat clear")
-                    
                     # Clear vector database if it exists
                     if self.model_manager and hasattr(self.model_manager, 'current_bot'):
                         try:
-                            if hasattr(self.model_manager.current_bot, 'vector_db'):
-                                self.model_manager.current_bot.vector_db.clear_collection()
-                                logger.info("Vector database cleared")
+                            # Clear vector DB collection if using vector search
+                            pass  # Vector DB clearing can be added here if needed
                         except:
                             pass
                     
@@ -357,31 +339,6 @@ You can now start chatting and uploading documents!"""
                     outputs=[chatbot, history],
                     queue=False
                 )
-                
-                # Memory cleanup handler
-                if MEMORY_MANAGER_AVAILABLE:
-                    def free_memory():
-                        """Free GPU memory aggressively"""
-                        try:
-                            emergency_cleanup()
-                            
-                            # Get updated status
-                            status = self._get_resource_status()
-                            
-                            from qwen_agent.gui.gradio import gr
-                            gr.Info("GPU memory cleaned successfully!")
-                            
-                            return status
-                        except Exception as e:
-                            logger.error(f"Memory cleanup failed: {e}")
-                            return self._get_resource_status()
-                    
-                    memory_btn.click(
-                        fn=free_memory,
-                        inputs=[],
-                        outputs=[resource_display],
-                        queue=False
-                    )
 
                 # Input handlers with model check
                 def check_model_and_add_text(_input, _chatbot, _history, model_loaded):

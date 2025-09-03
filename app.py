@@ -23,15 +23,12 @@ from custom_assistant import VectorDBAssistant
 POSITIVE_INFINITY = math.inf
 
 # Update this path to your local model path
-LOCAL_MODEL_PATH = r"C:\Users\ajay.patidar\.cache\huggingface\hub\models--Qwen--Qwen2.5-7B-Instruct\snapshots\e28526f7bb80e2a9c8af03b831a9af3812f18fba"
+LOCAL_MODEL_PATH = r"Qwen/Qwen2.5-7B-Instruct-1M"
 
 # Import local_llm to register the model type
 import local_llm
 
-# Import memory manager
-from memory_manager import get_memory_manager, cleanup_memory
-
-@register_tool('vector_search')
+@register_tool('_vector_search')
 class VectorSearch(BaseSearch):
     """Vector database search for long documents"""
     
@@ -183,16 +180,13 @@ class ModelManager:
         }
     
     def unload_current_model(self):
-        """Completely unload current model from memory with aggressive cleanup"""
+        """Completely unload current model from memory"""
         if self.current_bot is not None:
             logger.info("Unloading current model...")
             
             # Delete the LLM instance
             if hasattr(self.current_bot, 'llm'):
                 if hasattr(self.current_bot.llm, 'model'):
-                    # Clear model caches first
-                    if hasattr(self.current_bot.llm, '_clear_model_cache'):
-                        self.current_bot.llm._clear_model_cache()
                     # Delete the actual model
                     del self.current_bot.llm.model
                 # Delete the LLM wrapper
@@ -203,18 +197,14 @@ class ModelManager:
             self.current_bot = None
             self.current_llm_instance = None
             
-            # Aggressive memory cleanup
-            for _ in range(3):
-                gc.collect()
+            # Force garbage collection
+            gc.collect()
             
             # Clear CUDA cache multiple times
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            
-            # Use memory manager for thorough cleanup
-            cleanup_memory()
             
             # Log memory freed
             if torch.cuda.is_available():
@@ -349,7 +339,7 @@ def app_gui():
     
     # Pass the model manager to WebUI
     web_ui = WebUI(placeholder_bot, chatbot_config=chatbot_config, model_manager=model_manager)
-    web_ui.run(share=False, server_name="127.0.0.1", server_port=7860)
+    web_ui.run(share=True, server_name="127.0.0.1", server_port=7860)
 
 if __name__ == '__main__':
     import patching  # patch qwen-agent to accelerate processing
