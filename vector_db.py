@@ -84,7 +84,7 @@ class VectorDatabase:
                     document_id: str,
                     chunks: List[str],
                     metadata: Optional[Dict[str, Any]] = None,
-                    chunk_size: int = 512,
+                     chunk_size: int = 512,
                     chunk_overlap: int = 128) -> bool:
         """
         Add document chunks to vector database

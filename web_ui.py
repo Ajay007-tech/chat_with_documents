@@ -14,6 +14,14 @@ from qwen_agent.llm.schema import CONTENT, FILE, IMAGE, NAME, ROLE, USER, Messag
 from qwen_agent.log import logger
 from qwen_agent.utils.utils import print_traceback
 
+# Import memory management
+try:
+    from memory_manager import cleanup_memory, emergency_cleanup, get_memory_manager
+    MEMORY_MANAGER_AVAILABLE = True
+except ImportError:
+    MEMORY_MANAGER_AVAILABLE = False
+    logger.warning("Memory manager not available")
+
 try:
     from patching import common_programming_language_extensions
 except ImportError:
@@ -41,28 +49,23 @@ class WebUI:
         # Store model manager for dynamic loading
         self.model_manager = model_manager
         self.enable_quantization_selector = chatbot_config.get('quantization_selector', False)
-        self.lazy_loading = chatbot_config.get('lazy_loading', False)
-        
-        # Initialize with no agent if lazy loading
-        if self.lazy_loading:
-            self.agent_list = []
-            self.current_agent = None
+        # Lazy loading bypassed, always expect a model
+        self.lazy_loading = False  
+
+        if isinstance(agent, MultiAgentHub):
+            self.agent_list = [agent for agent in agent.nonuser_agents]
+            self.agent_hub = agent
+        elif isinstance(agent, list):
+            self.agent_list = agent
+            self.agent_hub = None
+        elif agent is not None:
+            self.agent_list = [agent]
             self.agent_hub = None
         else:
-            if isinstance(agent, MultiAgentHub):
-                self.agent_list = [agent for agent in agent.nonuser_agents]
-                self.agent_hub = agent
-            elif isinstance(agent, list):
-                self.agent_list = agent
-                self.agent_hub = None
-            elif agent is not None:
-                self.agent_list = [agent]
-                self.agent_hub = None
-            else:
-                self.agent_list = []
-                self.agent_hub = None
-            
-            self.current_agent = self.agent_list[0] if self.agent_list else None
+            self.agent_list = []
+            self.agent_hub = None
+
+        self.current_agent = self.agent_list[0] if self.agent_list else None
 
         user_name = chatbot_config.get('user.name', 'user')
         self.user_config = {
@@ -111,32 +114,21 @@ class WebUI:
         with gr.Blocks(
                 css=os.path.join(os.path.dirname(__file__), 'assets/appBot.css') if os.path.exists(os.path.join(os.path.dirname(__file__), 'assets/appBot.css')) else None,
                 theme=customTheme,
-                title="Qwen2.5 Local Chat"
+                title="KnightBot"
         ) as demo:
             history = gr.State([])
-            model_loaded_state = gr.State(False)
+            model_loaded_state = gr.State(True)
 
             with gr.Row(elem_classes='container'):
                 with gr.Column(scale=4):
                     chatbot = mgr.Chatbot(
-                        value=convert_history_to_chatbot(messages=messages) if messages else [],
-                        avatar_images=[
-                            self.user_config,
-                            self.agent_config_list,
-                        ],
+                        # value=convert_history_to_chatbot(messages=messages) if messages else [],
+                        value=[],
+                        avatar_images=None,
                         height=600,
-                        avatar_image_width=80,
                         flushing=False,
                         show_copy_button=True,
-                        latex_delimiters=[{
-                            'left': '\\(',
-                            'right': '\\)',
-                            'display': True
-                        }, {
-                            'left': '\\[',
-                            'right': '\\]',
-                            'display': True
-                        }]
+                        
                     )
 
                     with gr.Row():
@@ -146,61 +138,55 @@ class WebUI:
                                 file_types=[".pdf", ".docx", ".pptx", ".txt", ".html", ".csv", ".tsv", ".xlsx", ".xls"] + 
                                 ["." + ext for ext in common_programming_language_extensions]
                             ),
-                            interactive=False  # Disabled until model is loaded
+                            interactive=True  # Disabled until model is loaded
                         )
 
-                with gr.Column(scale=1):
-                    # Model configuration section
-                    if self.enable_quantization_selector and self.model_manager:
-                        gr.Markdown("## 🤖 Model Configuration")
+                # with gr.Column(scale=1):
+                #     # Model configuration section
+                #     if self.enable_quantization_selector and self.model_manager:
+                #         gr.Markdown("## 🤖 Model Configuration")
                         
-                        quantization_selector = gr.Radio(
-                            choices=[
-                                ("4-bit + Vector DB (Unlimited docs)", "4bit"),
-                                ("8-bit (16k tokens)", "8bit"),
-                                ("Full Precision (8k tokens)", "full")
-                            ],
-                            label="Select Configuration",
-                            value="4bit",
-                            interactive=True,
-                        )
+                #         quantization_selector = gr.Radio(
+                #             choices=[
+                #                 ("4-bit + Vector DB (Unlimited docs)", "4bit"),
+                #                 ("8-bit (16k tokens)", "8bit"),
+                #                 ("Full Precision (8k tokens)", "full")
+                #             ],
+                #             label="Select Configuration",
+                #             value="4bit",
+                #             interactive=True,
+                #         )
                         
-                        load_model_btn = gr.Button(
-                            "🚀 Load Model", 
-                            variant="primary",
-                            size="lg"
-                        )
+                #         load_model_btn = gr.Button(
+                #             "🚀 Load Model", 
+                #             variant="primary",
+                #             size="lg"
+                #         )
                         
-                        model_status = gr.Markdown("""
-⚠️ **No Model Loaded**
+                #         # model_status = gr.Markdown()                       
+                #         # System resources display
+                #         # gr.Markdown("### 📊 System Resources")
+                #         # resource_display = gr.Markdown(self._get_resource_status())
+                        
+                #         # Manual refresh button (without size parameter for compatibility)
+                #         # refresh_btn = gr.Button("🔄 Refresh Stats", variant="secondary")
+                        
+                #     else:
+                #         quantization_selector = gr.State("4bit")
+                #         model_status = gr.State("")
+                #         load_model_btn = gr.State(None)
+                #         resource_display = gr.State("")
+                #         refresh_btn = gr.State(None)
 
-Please select a configuration and click 'Load Model' to begin.
-
-**Configuration Guide:**
-- **4-bit + Vector DB**: Best for long documents (PDFs, books). Uses vector database for unlimited document size.
-- **8-bit**: Balanced performance for medium documents.
-- **Full Precision**: Best quality for short documents.
-                        """)
-                        
-                        # System resources display
-                        gr.Markdown("### 📊 System Resources")
-                        resource_display = gr.Markdown(self._get_resource_status())
-                        
-                        # Manual refresh button (without size parameter for compatibility)
-                        refresh_btn = gr.Button("🔄 Refresh Stats", variant="secondary")
-                        
-                    else:
-                        quantization_selector = gr.State("4bit")
-                        model_status = gr.State("")
-                        load_model_btn = gr.State(None)
-                        resource_display = gr.State("")
-                        refresh_btn = gr.State(None)
-
-                    # Agent info
-                    agent_info_block = self._create_agent_info_block()
+                #     # Agent info
+                #     agent_info_block = self._create_agent_info_block()
                     
-                    # Clear button
-                    clear_btn = gr.Button("🗑️ Clear Chat", variant="secondary")
+                #     # Clear button
+                #     clear_btn = gr.Button("🗑️ Clear Chat", variant="secondary")
+                    
+                #     # Memory cleanup button
+                #     if MEMORY_MANAGER_AVAILABLE:
+                #         memory_btn = gr.Button("🧹 Free GPU Memory", variant="secondary")
 
                     if self.prompt_suggestions:
                         gr.Examples(
@@ -226,8 +212,8 @@ Please select a configuration and click 'Load Model' to begin.
                                 _history, 
                                 gr.update(interactive=False),
                                 gr.update(interactive=False),
-                                False,
-                                self._get_resource_status()
+                                False
+                                # self._get_resource_status()
                             )
                             
                             # Load the model
@@ -247,22 +233,10 @@ Please select a configuration and click 'Load Model' to begin.
                                 limits = self.model_manager.get_current_limits()
                                 
                                 # Build status message
-                                status = f"""✅ **Model Successfully Loaded!**
-
-**Configuration:** {quantization.upper()}
-**Mode:** {"Vector Database (Unlimited documents)" if limits.get('use_vector_db') else "Direct Context"}
-
-**Token Limits:**
-- Max Context: {limits['max_context_tokens']:,} tokens
-- Max Document: {"Unlimited with Vector DB" if limits.get('use_vector_db') else f"{limits['max_ref_token']:,} tokens"}
-- Max Response: {limits['max_new_tokens']:,} tokens
-
-{"📚 **Vector Database Active**: Upload any size document! The system will automatically chunk and index it for efficient retrieval." if limits.get('use_vector_db') else ""}
-
-You can now start chatting and uploading documents!"""
+                                status = ""
                                 
                                 # Update resource display
-                                resource_status = self._get_resource_status()
+                                # resource_status = self._get_resource_status()
                                 
                                 yield (
                                     status, 
@@ -270,8 +244,8 @@ You can now start chatting and uploading documents!"""
                                     _history, 
                                     gr.update(interactive=True, value="🔄 Switch Model"),
                                     gr.update(interactive=True, placeholder="Type your message or upload documents..."),
-                                    True,
-                                    resource_status
+                                    True
+                                    # resource_status
                                 )
                             else:
                                 raise Exception("Failed to load model")
@@ -297,48 +271,79 @@ You can now start chatting and uploading documents!"""
                                 _history, 
                                 gr.update(interactive=True),
                                 gr.update(interactive=False),
-                                False,
-                                self._get_resource_status()
+                                False
+                                # self._get_resource_status()
                             )
-                    
-                    load_model_btn.click(
-                        fn=load_new_model,
-                        inputs=[quantization_selector, chatbot, history],
-                        outputs=[model_status, chatbot, history, load_model_btn, input, model_loaded_state, resource_display],
-                        queue=True,
-                    )
+
+                    # load_model_btn.click(
+                    #     fn=load_new_model,
+                    #     inputs=[quantization_selector, chatbot, history],
+                    #     outputs=[model_status, chatbot, history, load_model_btn, input, model_loaded_state, resource_display],
+                    #     queue=True,
+                    # )
                     
                     # Manual refresh button handler
-                    def refresh_resources():
-                        return self._get_resource_status()
+                    # def refresh_resources():
+                    #     return self._get_resource_status()
                     
-                    refresh_btn.click(
-                        fn=refresh_resources,
-                        inputs=[],
-                        outputs=[resource_display]
-                    )
+                    # refresh_btn.click(
+                    #     fn=refresh_resources,
+                    #     inputs=[],
+                    #     outputs=[resource_display]
+                    # )
 
                 # Clear chat handler
                 def clear_chat(_chatbot, _history):
                     _chatbot = []
                     _history.clear()
                     
+                    # Clear memory
+                    if MEMORY_MANAGER_AVAILABLE:
+                        cleanup_memory()
+                        logger.info("Memory cleaned after chat clear")
+                    
                     # Clear vector database if it exists
                     if self.model_manager and hasattr(self.model_manager, 'current_bot'):
                         try:
-                            # Clear vector DB collection if using vector search
-                            pass  # Vector DB clearing can be added here if needed
+                            if hasattr(self.model_manager.current_bot, 'vector_db'):
+                                self.model_manager.current_bot.vector_db.clear_collection()
+                                logger.info("Vector database cleared")
                         except:
                             pass
                     
                     return _chatbot, _history
                 
-                clear_btn.click(
-                    fn=clear_chat,
-                    inputs=[chatbot, history],
-                    outputs=[chatbot, history],
-                    queue=False
-                )
+                # clear_btn.click(
+                #     fn=clear_chat,
+                #     inputs=[chatbot, history],
+                #     outputs=[chatbot, history],
+                #     queue=False
+                # )
+                
+                # Memory cleanup handler
+                # if MEMORY_MANAGER_AVAILABLE:
+                #     def free_memory():
+                #         """Free GPU memory aggressively"""
+                #         try:
+                #             emergency_cleanup()
+                            
+                #             # Get updated status
+                #             # status = self._get_resource_status()
+                            
+                #             from qwen_agent.gui.gradio import gr
+                #             gr.Info("GPU memory cleaned successfully!")
+                            
+                #             return status
+                #         except Exception as e:
+                #             logger.error(f"Memory cleanup failed: {e}")
+                #             return self._get_resource_status()
+                    
+                #     memory_btn.click(
+                #         fn=free_memory,
+                #         inputs=[],
+                #         outputs=[resource_display],
+                #         queue=False
+                #     )
 
                 # Input handlers with model check
                 def check_model_and_add_text(_input, _chatbot, _history, model_loaded):
@@ -480,7 +485,7 @@ You can now start chatting and uploading documents!"""
                 bot_avatar=agent_config['avatar'],
             ))
     
-    def _get_resource_status(self):
+    '''def _get_resource_status(self):
         """Get current system resource status"""
         status_lines = []
         
@@ -515,5 +520,5 @@ You can now start chatting and uploading documents!"""
             status_lines.append(f"✅ **Model:** {self.model_manager.current_quantization or 'Unknown'}")
         else:
             status_lines.append("⚪ **Model:** Not loaded")
-        
-        return "\n".join(status_lines)
+        status_lines=''
+        return "\n".join(status_lines)'''

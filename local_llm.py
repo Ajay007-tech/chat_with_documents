@@ -1,16 +1,16 @@
 """
-Local LLM handler for Qwen models with proper qwen_agent integration and memory management
+Local LLM handler for Qwen models with memory management and OCR support
 """
 
 import torch
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from typing import List, Iterator, Optional, Dict, Any, Union
-from http import HTTPStatus
-import time
-import re
 from threading import Thread
 from qwen_agent.log import logger
+
+# Import memory management
+from memory_manager import MemoryManager, GenerationMemoryManager, cleanup_memory
 
 # Import the necessary qwen_agent components
 from qwen_agent.llm.base import register_llm, BaseChatModel
@@ -27,13 +27,17 @@ class QwenLocalModel(BaseChatModel):
         self.model = None
         self.tokenizer = None
         
+        # Initialize memory manager
+        self.memory_manager = MemoryManager()
+        self.generation_manager = None
+        
         # Set max context based on quantization
         if self.load_in_4bit:
-            self.max_context_tokens = cfg.get("max_context_tokens", 32768)  # 32k for 4-bit
+            self.max_context_tokens = cfg.get("max_context_tokens", 32768)
         elif self.load_in_8bit:
-            self.max_context_tokens = cfg.get("max_context_tokens", 16384)  # 16k for 8-bit
+            self.max_context_tokens = cfg.get("max_context_tokens", 16384)
         else:
-            self.max_context_tokens = cfg.get("max_context_tokens", 8192)   # 8k for full precision
+            self.max_context_tokens = cfg.get("max_context_tokens", 8192)
             
         logger.info(f"Max context tokens set to: {self.max_context_tokens}")
         self._load_model()
@@ -43,8 +47,7 @@ class QwenLocalModel(BaseChatModel):
         if self.model is not None:
             # Clear existing model
             del self.model
-            torch.cuda.empty_cache()
-            gc.collect()
+            self.memory_manager.cleanup_gpu_cache(force=True)
         
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True)
         
@@ -66,7 +69,8 @@ class QwenLocalModel(BaseChatModel):
                 quantization_config=quant_config,
                 trust_remote_code=True,
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                offload_buffers=True,  # Offload buffers to CPU when not in use
             )
             logger.info("Loaded model in 4-bit quantization")
         elif self.load_in_8bit:
@@ -81,7 +85,8 @@ class QwenLocalModel(BaseChatModel):
                 quantization_config=quant_config,
                 trust_remote_code=True,
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                offload_buffers=True,
             )
             logger.info("Loaded model in 8-bit quantization")
         else:
@@ -90,14 +95,23 @@ class QwenLocalModel(BaseChatModel):
                 device_map="auto",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
                 trust_remote_code=True,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                offload_buffers=True,
             )
             logger.info("Loaded model in full precision (16-bit)")
         
         self.model.eval()
         
+        # Initialize generation memory manager
+        self.generation_manager = GenerationMemoryManager(self)
+        
         # Clear cache after loading
-        torch.cuda.empty_cache()
+        self.memory_manager.cleanup_gpu_cache()
+        
+        # Log initial memory usage
+        info = self.memory_manager.get_memory_info()
+        if 'gpu_allocated_gb' in info:
+            logger.info(f"Model loaded. GPU memory: {info['gpu_allocated_gb']:.2f}GB allocated")
 
     def _convert_messages_to_list(self, messages: List[Message]) -> List[Dict[str, str]]:
         """Convert Message objects to dict format for tokenizer"""
@@ -166,6 +180,41 @@ class QwenLocalModel(BaseChatModel):
         
         return truncated_messages
 
+    def _clear_model_cache(self):
+        """Clear model's internal caches to free memory"""
+        if self.model is None:
+            return
+            
+        try:
+            # Clear KV cache in attention layers
+            if hasattr(self.model, 'model'):
+                base_model = self.model.model
+                
+                # For Qwen models
+                if hasattr(base_model, 'layers'):
+                    for layer in base_model.layers:
+                        if hasattr(layer, 'self_attn'):
+                            # Clear any cached keys/values
+                            layer.self_attn.cache_k = None
+                            layer.self_attn.cache_v = None
+                            layer.self_attn.cached_key = None
+                            layer.self_attn.cached_value = None
+                
+                # For transformer models
+                elif hasattr(base_model, 'h'):
+                    for layer in base_model.h:
+                        if hasattr(layer, 'attn'):
+                            layer.attn.cache_k = None
+                            layer.attn.cache_v = None
+            
+            # Force cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.debug(f"Could not clear model cache: {e}")
+
     def _chat_stream(
         self,
         messages: List[Message],
@@ -175,6 +224,10 @@ class QwenLocalModel(BaseChatModel):
     ) -> Iterator[List[Message]]:
         """Stream chat responses with memory management"""
         generate_cfg = generate_cfg or {}
+        
+        # Pre-generation cleanup
+        if self.generation_manager:
+            self.generation_manager.pre_generation()
         
         try:
             # Convert messages to proper format
@@ -193,6 +246,9 @@ class QwenLocalModel(BaseChatModel):
                 tokenize=False,
                 add_generation_prompt=True
             )
+            
+            # Clear model cache before generation
+            self._clear_model_cache()
             
             inputs = self.tokenizer(
                 text, 
@@ -212,14 +268,15 @@ class QwenLocalModel(BaseChatModel):
             
             generation_kwargs = dict(
                 **inputs,
-                max_new_tokens=min(generate_cfg.get("max_new_tokens", 512), 2048),  # Cap at 2048
+                max_new_tokens=min(generate_cfg.get("max_new_tokens", 512), 2048),
                 temperature=generate_cfg.get("temperature", 0.7),
                 top_p=generate_cfg.get("top_p", 0.9),
                 do_sample=generate_cfg.get("temperature", 0.7) > 0,
                 repetition_penalty=generate_cfg.get("repetition_penalty", 1.05),
                 streamer=streamer,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,  # Use KV cache for efficiency
             )
             
             # Start generation in a separate thread
@@ -237,22 +294,37 @@ class QwenLocalModel(BaseChatModel):
             
             thread.join()
             
+            # Clear inputs to free memory
+            del inputs
+            
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"CUDA OOM: {e}")
-            torch.cuda.empty_cache()
-            gc.collect()
+            self.memory_manager.emergency_cleanup()
+            
             error_msg = (
                 "⚠️ GPU memory exceeded. The document is too long for the current settings.\n\n"
                 "Please try:\n"
-                "1. Using 4-bit quantization for longer documents\n"
-                "2. Uploading smaller documents\n"
-                "3. Clearing the chat history with /clear"
+                "1. Clear the chat history with /clear\n"
+                "2. Use a smaller document\n"
+                "3. Restart the application"
             )
             yield [Message(role=ASSISTANT, content=error_msg)]
+            
         except Exception as e:
             logger.error(f"Generation error: {e}")
             print_traceback()
             yield [Message(role=ASSISTANT, content=f"Error during generation: {str(e)}")]
+        
+        finally:
+            # Post-generation cleanup
+            if self.generation_manager:
+                self.generation_manager.post_generation()
+            
+            # Clear model cache after generation
+            self._clear_model_cache()
+            
+            # Cleanup memory
+            self.memory_manager.cleanup_gpu_cache()
 
     def _chat_no_stream(
         self,
@@ -262,6 +334,10 @@ class QwenLocalModel(BaseChatModel):
     ) -> List[Message]:
         """Non-streaming chat with memory management"""
         generate_cfg = generate_cfg or {}
+        
+        # Pre-generation cleanup
+        if self.generation_manager:
+            self.generation_manager.pre_generation()
         
         try:
             # Convert messages to proper format
@@ -281,6 +357,9 @@ class QwenLocalModel(BaseChatModel):
                 add_generation_prompt=True
             )
             
+            # Clear model cache before generation
+            self._clear_model_cache()
+            
             inputs = self.tokenizer(
                 text, 
                 return_tensors="pt",
@@ -293,40 +372,53 @@ class QwenLocalModel(BaseChatModel):
             with torch.no_grad():
                 output_ids = self.model.generate(
                     **inputs,
-                    max_new_tokens=min(generate_cfg.get("max_new_tokens", 512), 2048),  # Cap at 2048
+                    max_new_tokens=min(generate_cfg.get("max_new_tokens", 512), 2048),
                     temperature=generate_cfg.get("temperature", 0.7),
                     top_p=generate_cfg.get("top_p", 0.9),
                     do_sample=generate_cfg.get("temperature", 0.7) > 0,
                     repetition_penalty=generate_cfg.get("repetition_penalty", 1.05),
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=True,
                 )
             
             # Decode only the generated part
             generated_ids = output_ids[0][inputs['input_ids'].shape[-1]:]
             generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
             
-            # Clear cache after generation
-            torch.cuda.empty_cache()
+            # Clear outputs to free memory
+            del output_ids, inputs
             
             return [Message(role=ASSISTANT, content=generated_text)]
             
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"CUDA OOM: {e}")
-            torch.cuda.empty_cache()
-            gc.collect()
+            self.memory_manager.emergency_cleanup()
+            
             error_msg = (
                 "⚠️ GPU memory exceeded. The document is too long for the current settings.\n\n"
                 "Please try:\n"
-                "1. Using 4-bit quantization for longer documents\n"
-                "2. Uploading smaller documents\n"
-                "3. Clearing the chat history with /clear"
+                "1. Clear the chat history with /clear\n"
+                "2. Use a smaller document\n"
+                "3. Restart the application"
             )
             return [Message(role=ASSISTANT, content=error_msg)]
+            
         except Exception as e:
             logger.error(f"Generation error: {e}")
             print_traceback()
             return [Message(role=ASSISTANT, content=f"Error during generation: {str(e)}")]
+        
+        finally:
+            # Post-generation cleanup
+            if self.generation_manager:
+                self.generation_manager.post_generation()
+            
+            # Clear model cache after generation
+            self._clear_model_cache()
+            
+            # Cleanup memory
+            self.memory_manager.cleanup_gpu_cache()
 
     def _chat_with_functions(
         self,
